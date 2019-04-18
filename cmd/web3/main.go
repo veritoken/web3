@@ -11,6 +11,8 @@ import (
 	"math/big"
 	"os"
 	"os/signal"
+	"os/user"
+	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -22,6 +24,10 @@ import (
 	"github.com/gochain-io/gochain/v3/core/types"
 	"github.com/gochain-io/web3"
 	"github.com/gochain-io/web3/assets"
+	"github.com/gochain-io/web3/did"
+	"github.com/ipfs/go-ipfs/core"
+	"github.com/ipfs/go-ipfs/core/coreapi"
+	"github.com/ipfs/go-ipfs/repo/fsrepo"
 	"github.com/urfave/cli"
 )
 
@@ -599,6 +605,26 @@ func main() {
 					},
 					Action: func(c *cli.Context) {
 						GenerateCode(ctx, c)
+					},
+				},
+			},
+		},
+		{
+			Name:    "did",
+			Aliases: []string{"c"},
+			Usage:   "Distributed identity operations",
+			Subcommands: []cli.Command{
+				{
+					Name:  "create",
+					Usage: "Create a new DID",
+					Flags: []cli.Flag{
+						cli.StringFlag{
+							Name:  "id",
+							Usage: "The DID idstring.",
+						},
+					},
+					Action: func(c *cli.Context) {
+						CreateDID(ctx, network.URL, privateKey, c.String("id"), c.String("registry"))
 					},
 				},
 			},
@@ -1288,6 +1314,91 @@ func ResumeContract(ctx context.Context, rpcURL, privateKey, contractAddress str
 		log.Fatalf("Cannot resume the contract: %v", err)
 	}
 	ctx, _ = context.WithTimeout(ctx, 60*time.Second)
+	receipt, err := web3.WaitForReceipt(ctx, client, tx.Hash)
+	if err != nil {
+		log.Fatalf("Cannot get the receipt: %v", err)
+	}
+	fmt.Println("Transaction address:", receipt.TxHash.Hex())
+}
+
+func CreateDID(ctx context.Context, rpcURL, privateKey, id, registryAddress string) {
+	if id == "" {
+		log.Fatalf("ID required")
+	} else if !did.IsValidIDString(id) {
+		log.Fatalf("ID contains invalid characters")
+	}
+
+	// Initialize IPFS.
+	repoPath := ".ipfs"
+	if u, _ := user.Current(); u != nil && u.HomeDir != "" {
+		repoPath = filepath.Join(u.HomeDir, ".ipfs")
+	}
+	repo, err := fsrepo.Open(repoPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ipfsNode, err := core.NewNode(ctx, &core.BuildCfg{Repo: repo})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Parse key.
+	acc, err := web3.ParsePrivateKey(privateKey)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Build DID identifier.
+	d := did.DID{Method: "gochain", ID: id}
+	publicKeyID := (&did.DID{Method: "gochain", ID: id, Fragment: "owner"}).String()
+
+	// Build DID document.
+	now := time.Now()
+	doc := did.NewDocument()
+	doc.ID = d.String()
+	doc.Created = &now
+	doc.Updated = &now
+	doc.PublicKeys = []did.PublicKey{{
+		ID:           publicKeyID,
+		Type:         "Secp256k1VerificationKey2018",
+		Controller:   d.String(),
+		PublicKeyHex: strings.TrimPrefix(acc.PublicKey(), "0x"),
+	}}
+	doc.Authentications = []interface{}{publicKeyID}
+
+	// Pretty print document.
+	data, err := json.MarshalIndent(doc, "", "\t")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Upload to IPFS.
+	coreAPI, err := coreapi.NewCoreAPI(ipfsNode)
+	if err != nil {
+		log.Fatal(err)
+	}
+	path, err := coreAPI.Unixfs().Add(ctx, bytes.NewReader(data))
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("resolved path: %s", path)
+
+	client, err := web3.Dial(rpcURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to %q: %v", rpcURL, err)
+	}
+	defer client.Close()
+
+	myabi, err := abi.JSON(strings.NewReader(assets.DIDRegistryABI))
+	if err != nil {
+		log.Fatalf("Cannot initialize DIDRegistry ABI: %v", err)
+	}
+	tx, err := web3.CallTransactFunction(ctx, client, myabi, registryAddress, privateKey, "register", 0, id, path)
+	if err != nil {
+		log.Fatalf("Cannot register DID identifier: %v", err)
+	}
+
+	ctx, _ = context.WithTimeout(ctx, 10*time.Second)
 	receipt, err := web3.WaitForReceipt(ctx, client, tx.Hash)
 	if err != nil {
 		log.Fatalf("Cannot get the receipt: %v", err)
