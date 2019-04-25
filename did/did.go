@@ -23,7 +23,7 @@ func (d *DID) String() string {
 	if d.Fragment != "" {
 		fmt.Fprintf(&buf, "#%s", escape(d.Fragment, encodeFragment))
 	}
-	return d.String()
+	return buf.String()
 }
 
 func Parse(rawdid string) (*DID, error) {

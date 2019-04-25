@@ -7,7 +7,6 @@ require (
 	github.com/edsrzf/mmap-go v1.0.0 // indirect
 	github.com/go-stack/stack v1.8.0 // indirect
 	github.com/gochain-io/gochain/v3 v3.0.11
-	github.com/ipfs/go-ipfs v0.4.20
 	github.com/urfave/cli v1.20.0
 	go.opencensus.io v0.19.0 // indirect
 	golang.org/x/sync v0.0.0-20181221193216-37e7f081c4d4 // indirect

@@ -9,10 +9,10 @@ import (
 	"io/ioutil"
 	"log"
 	"math/big"
+	"mime/multipart"
+	"net/http"
 	"os"
 	"os/signal"
-	"os/user"
-	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
@@ -25,9 +25,6 @@ import (
 	"github.com/gochain-io/web3"
 	"github.com/gochain-io/web3/assets"
 	"github.com/gochain-io/web3/did"
-	"github.com/ipfs/go-ipfs/core"
-	"github.com/ipfs/go-ipfs/core/coreapi"
-	"github.com/ipfs/go-ipfs/repo/fsrepo"
 	"github.com/urfave/cli"
 )
 
@@ -619,12 +616,75 @@ func main() {
 					Usage: "Create a new DID",
 					Flags: []cli.Flag{
 						cli.StringFlag{
-							Name:  "id",
-							Usage: "The DID idstring.",
+							Name:        "private-key,pk",
+							Usage:       "Private key",
+							EnvVar:      pkVarName,
+							Destination: &privateKey,
+						},
+						cli.StringFlag{
+							Name:  "registry",
+							Usage: "Registry contract address",
 						},
 					},
 					Action: func(c *cli.Context) {
-						CreateDID(ctx, network.URL, privateKey, c.String("id"), c.String("registry"))
+						CreateDID(ctx, network.URL, privateKey, c.Args().First(), c.String("registry"))
+					},
+				},
+				{
+					Name:  "owner",
+					Usage: "Display DID owner address",
+					Flags: []cli.Flag{
+						cli.StringFlag{
+							Name:        "private-key,pk",
+							Usage:       "Private key",
+							EnvVar:      pkVarName,
+							Destination: &privateKey,
+						},
+						cli.StringFlag{
+							Name:  "registry",
+							Usage: "Registry contract address",
+						},
+					},
+					Action: func(c *cli.Context) {
+						DIDOwner(ctx, network.URL, privateKey, c.Args().First(), c.String("registry"))
+					},
+				},
+				{
+					Name:  "hash",
+					Usage: "Display DID document IPFS hash",
+					Flags: []cli.Flag{
+						cli.StringFlag{
+							Name:        "private-key,pk",
+							Usage:       "Private key",
+							EnvVar:      pkVarName,
+							Destination: &privateKey,
+						},
+						cli.StringFlag{
+							Name:  "registry",
+							Usage: "Registry contract address",
+						},
+					},
+					Action: func(c *cli.Context) {
+						DIDHash(ctx, network.URL, privateKey, c.Args().First(), c.String("registry"))
+					},
+				},
+				{
+					Name:  "show",
+					Usage: "Display DID document",
+					Flags: []cli.Flag{
+						cli.StringFlag{
+							Name:        "private-key,pk",
+							Usage:       "Private key",
+							EnvVar:      pkVarName,
+							Destination: &privateKey,
+						},
+						cli.StringFlag{
+							Name:  "registry",
+							Usage: "Registry contract address",
+						},
+					},
+					Action: func(c *cli.Context) {
+						ShowDID(ctx, network.URL, privateKey, c.Args().First(), c.String("registry"))
 					},
 				},
 			},
@@ -1321,31 +1381,26 @@ func ResumeContract(ctx context.Context, rpcURL, privateKey, contractAddress str
 	fmt.Println("Transaction address:", receipt.TxHash.Hex())
 }
 
+// MaxDIDLength is the maximum size of the idstring of the GoChain DID.
+const MaxDIDLength = 32
+
 func CreateDID(ctx context.Context, rpcURL, privateKey, id, registryAddress string) {
+	if registryAddress == "" {
+		log.Fatalf("Registry contract address required")
+	}
+
 	if id == "" {
 		log.Fatalf("ID required")
 	} else if !did.IsValidIDString(id) {
 		log.Fatalf("ID contains invalid characters")
-	}
-
-	// Initialize IPFS.
-	repoPath := ".ipfs"
-	if u, _ := user.Current(); u != nil && u.HomeDir != "" {
-		repoPath = filepath.Join(u.HomeDir, ".ipfs")
-	}
-	repo, err := fsrepo.Open(repoPath)
-	if err != nil {
-		log.Fatal(err)
-	}
-	ipfsNode, err := core.NewNode(ctx, &core.BuildCfg{Repo: repo})
-	if err != nil {
-		log.Fatal(err)
+	} else if len(id) > MaxDIDLength {
+		log.Fatalf("ID must be less than 32 characters")
 	}
 
 	// Parse key.
 	acc, err := web3.ParsePrivateKey(privateKey)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Cannot parse private key: %s", err)
 	}
 
 	// Build DID identifier.
@@ -1373,15 +1428,10 @@ func CreateDID(ctx context.Context, rpcURL, privateKey, id, registryAddress stri
 	}
 
 	// Upload to IPFS.
-	coreAPI, err := coreapi.NewCoreAPI(ipfsNode)
+	hash, err := IPFSUpload(ctx, "did.json", data)
 	if err != nil {
 		log.Fatal(err)
 	}
-	path, err := coreAPI.Unixfs().Add(ctx, bytes.NewReader(data))
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("resolved path: %s", path)
 
 	client, err := web3.Dial(rpcURL)
 	if err != nil {
@@ -1393,7 +1443,11 @@ func CreateDID(ctx context.Context, rpcURL, privateKey, id, registryAddress stri
 	if err != nil {
 		log.Fatalf("Cannot initialize DIDRegistry ABI: %v", err)
 	}
-	tx, err := web3.CallTransactFunction(ctx, client, myabi, registryAddress, privateKey, "register", 0, id, path)
+
+	var idBytes32 [32]byte
+	copy(idBytes32[:], id)
+
+	tx, err := web3.CallTransactFunction(ctx, client, myabi, registryAddress, privateKey, "register", 0, idBytes32, hash)
 	if err != nil {
 		log.Fatalf("Cannot register DID identifier: %v", err)
 	}
@@ -1403,7 +1457,119 @@ func CreateDID(ctx context.Context, rpcURL, privateKey, id, registryAddress stri
 	if err != nil {
 		log.Fatalf("Cannot get the receipt: %v", err)
 	}
+	fmt.Println("Successfully registered DID:", d.String())
+	fmt.Println("DID Document IPFS Hash:", hash)
 	fmt.Println("Transaction address:", receipt.TxHash.Hex())
+}
+
+func DIDOwner(ctx context.Context, rpcURL, privateKey, id, registryAddress string) {
+	if registryAddress == "" {
+		log.Fatalf("Registry contract address required")
+	}
+
+	d, err := did.Parse(id)
+	if err != nil {
+		log.Fatalf("Invalid DID: %s", id)
+	}
+
+	client, err := web3.Dial(rpcURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to %q: %v", rpcURL, err)
+	}
+	defer client.Close()
+
+	myabi, err := abi.JSON(strings.NewReader(assets.DIDRegistryABI))
+	if err != nil {
+		log.Fatalf("Cannot initialize DIDRegistry ABI: %v", err)
+	}
+
+	var idBytes32 [32]byte
+	copy(idBytes32[:], d.ID)
+
+	result, err := web3.CallConstantFunction(ctx, client, myabi, registryAddress, "owner", idBytes32)
+	if err != nil {
+		log.Fatalf("Cannot call the contract: %v", err)
+	}
+
+	ctx, _ = context.WithTimeout(ctx, 10*time.Second)
+	address := result.(common.Address)
+	fmt.Println(address.Hex())
+}
+
+func DIDHash(ctx context.Context, rpcURL, privateKey, id, registryAddress string) {
+	if registryAddress == "" {
+		log.Fatalf("Registry contract address required")
+	}
+
+	d, err := did.Parse(id)
+	if err != nil {
+		log.Fatalf("Invalid DID: %s", id)
+	}
+
+	client, err := web3.Dial(rpcURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to %q: %v", rpcURL, err)
+	}
+	defer client.Close()
+
+	myabi, err := abi.JSON(strings.NewReader(assets.DIDRegistryABI))
+	if err != nil {
+		log.Fatalf("Cannot initialize DIDRegistry ABI: %v", err)
+	}
+
+	var idBytes32 [32]byte
+	copy(idBytes32[:], d.ID)
+
+	result, err := web3.CallConstantFunction(ctx, client, myabi, registryAddress, "hash", idBytes32)
+	if err != nil {
+		log.Fatalf("Cannot call the contract: %v", err)
+	}
+
+	ctx, _ = context.WithTimeout(ctx, 10*time.Second)
+	hash := result.(string)
+	fmt.Println(hash)
+}
+
+func ShowDID(ctx context.Context, rpcURL, privateKey, id, registryAddress string) {
+	if registryAddress == "" {
+		log.Fatalf("Registry contract address required")
+	}
+
+	d, err := did.Parse(id)
+	if err != nil {
+		log.Fatalf("Invalid DID: %s", id)
+	}
+
+	client, err := web3.Dial(rpcURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to %q: %v", rpcURL, err)
+	}
+	defer client.Close()
+
+	myabi, err := abi.JSON(strings.NewReader(assets.DIDRegistryABI))
+	if err != nil {
+		log.Fatalf("Cannot initialize DIDRegistry ABI: %v", err)
+	}
+
+	var idBytes32 [32]byte
+	copy(idBytes32[:], d.ID)
+
+	result, err := web3.CallConstantFunction(ctx, client, myabi, registryAddress, "hash", idBytes32)
+	if err != nil {
+		log.Fatalf("Cannot call the contract: %v", err)
+	}
+
+	ctx, _ = context.WithTimeout(ctx, 10*time.Second)
+
+	hash := result.(string)
+	resp, err := http.Get(fmt.Sprintf("https://ipfs.infura.io:5001/api/v0/get?arg=%s", hash))
+	if err != nil {
+		log.Fatalf("Unable to fetch DID document from IPFS: %s", err)
+	}
+	defer resp.Body.Close()
+
+	io.Copy(os.Stdout, resp.Body)
+	fmt.Println("")
 }
 
 func marshalJSON(data interface{}) string {
@@ -1430,4 +1596,36 @@ func getAbi(contractFile string) *abi.ABI {
 func fatalExit(err error) {
 	fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 	os.Exit(1)
+}
+
+// IPFSUpload uploads data to IPFS with a given filename.
+func IPFSUpload(ctx context.Context, name string, data []byte) (string, error) {
+	// Build multi-part request body.
+	var body bytes.Buffer
+	mpw := multipart.NewWriter(&body)
+	if part, err := mpw.CreateFormFile("file", name); err != nil {
+		return "", err
+	} else if _, err := part.Write(data); err != nil {
+		return "", err
+	} else if err := mpw.Close(); err != nil {
+		return "", err
+	}
+
+	// Execute POST against Infura API.
+	resp, err := http.Post("https://ipfs.infura.io:5001/api/v0/add?pin=true", mpw.FormDataContentType(), &body)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// Unmarshal into data structure to extract hash.
+	var jsonResp struct {
+		Name string
+		Hash string
+		Size string
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jsonResp); err != nil {
+		return "", err
+	}
+	return jsonResp.Hash, nil
 }
