@@ -22,10 +22,13 @@ import (
 	"github.com/gochain-io/gochain/v3/common"
 	"github.com/gochain-io/gochain/v3/common/hexutil"
 	"github.com/gochain-io/gochain/v3/core/types"
+	"github.com/gochain-io/gochain/v3/crypto"
 	"github.com/gochain-io/web3"
 	"github.com/gochain-io/web3/assets"
 	"github.com/gochain-io/web3/did"
+	"github.com/gochain-io/web3/vc"
 	"github.com/urfave/cli"
+	"golang.org/x/crypto/sha3"
 )
 
 // Flags
@@ -685,6 +688,49 @@ func main() {
 					},
 					Action: func(c *cli.Context) {
 						ShowDID(ctx, network.URL, privateKey, c.Args().First(), c.String("registry"))
+					},
+				},
+			},
+		},
+
+		{
+			Name:    "claim",
+			Aliases: []string{"c"},
+			Usage:   "Verifiable claims operations",
+			Subcommands: []cli.Command{
+				{
+					Name:  "sign",
+					Usage: "Sign a verifiable claim",
+					Flags: []cli.Flag{
+						cli.StringFlag{
+							Name:        "private-key,pk",
+							Usage:       "Private key",
+							EnvVar:      pkVarName,
+							Destination: &privateKey,
+						},
+						cli.StringFlag{
+							Name:  "id",
+							Usage: "Credential ID",
+						},
+						cli.StringFlag{
+							Name:  "type",
+							Usage: "Credential type",
+						},
+						cli.StringFlag{
+							Name:  "issuer",
+							Usage: "Credential issuer DID",
+						},
+						cli.StringFlag{
+							Name:  "subject",
+							Usage: "Credential subject DID",
+						},
+						cli.StringFlag{
+							Name:  "data",
+							Usage: "Credential subject JSON object",
+						},
+					},
+					Action: func(c *cli.Context) {
+						SignClaim(ctx, network.URL, privateKey, c.String("id"), c.String("type"), c.String("issuer"), c.String("subject"), c.String("data"))
 					},
 				},
 			},
@@ -1570,6 +1616,78 @@ func ShowDID(ctx context.Context, rpcURL, privateKey, id, registryAddress string
 
 	io.Copy(os.Stdout, resp.Body)
 	fmt.Println("")
+}
+
+func SignClaim(ctx context.Context, rpcURL, privateKey, id, typ, issuerID, subjectID, subjectJSON string) {
+	if id == "" {
+		log.Fatalf("Credential ID required")
+	} else if typ == "" {
+		log.Fatalf("Credential type required")
+	}
+	if issuerID == "" {
+		log.Fatalf("Credential issuer DID required")
+	} else if _, err := did.Parse(issuerID); err != nil {
+		log.Fatalf("Invalid credential issuer DID: %s", err)
+	}
+	if subjectID == "" {
+		log.Fatalf("Credential subject DID required")
+	} else if _, err := did.Parse(subjectID); err != nil {
+		log.Fatalf("Invalid credential subject DID: %s", err)
+	}
+
+	// Parse key.
+	acc, err := web3.ParsePrivateKey(privateKey)
+	if err != nil {
+		log.Fatalf("Cannot parse private key: %s", err)
+	}
+
+	// Parse subject object.
+	subject := make(map[string]interface{})
+	if subjectJSON != "" {
+		if err := json.Unmarshal([]byte(subjectJSON), &subject); err != nil {
+			log.Fatalf("Cannot parse subject JSON data: %s", err)
+		}
+	}
+	subject["id"] = subjectID
+
+	// Store current time to the second.
+	now := time.Now().UTC().Truncate(1 * time.Second)
+
+	// Build verifiable credential.
+	cred := vc.NewVerifiableCredential()
+	cred.ID = id
+	cred.Type = append(cred.Type, typ)
+	cred.Issuer = issuerID
+	cred.IssuanceDate = &now
+	cred.CredentialSubject = subject
+
+	// Marshal data without proof.
+	hw := sha3.NewLegacyKeccak256()
+	if err := json.NewEncoder(hw).Encode(cred); err != nil {
+		log.Fatalf("Cannot marshal credential to JSON: %s", err)
+	}
+
+	// Sign hash of credential document.
+	var h common.Hash
+	hw.Sum(h[:0])
+	proofValue, err := crypto.Sign(h[:], acc.Key())
+	if err != nil {
+		log.Fatalf("Cannot sign credential: %s", err)
+	}
+
+	// Add proof to credential.
+	cred.Proof = &vc.Proof{
+		Type:       "Secp256k1VerificationKey2018",
+		Created:    &now,
+		ProofValue: common.Bytes2Hex(proofValue),
+	}
+
+	// Pretty print credential.
+	output, err := json.MarshalIndent(cred, "", "\t")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(string(output))
 }
 
 func marshalJSON(data interface{}) string {
