@@ -733,6 +733,25 @@ func main() {
 						SignClaim(ctx, network.URL, privateKey, c.String("id"), c.String("type"), c.String("issuer"), c.String("subject"), c.String("data"))
 					},
 				},
+				{
+					Name:  "verify",
+					Usage: "Verify a signed claim",
+					Flags: []cli.Flag{
+						cli.StringFlag{
+							Name:        "private-key,pk",
+							Usage:       "Private key",
+							EnvVar:      pkVarName,
+							Destination: &privateKey,
+						},
+						cli.StringFlag{
+							Name:  "registry",
+							Usage: "Registry contract address",
+						},
+					},
+					Action: func(c *cli.Context) {
+						VerifyClaim(ctx, network.URL, privateKey, c.String("registry"), c.Args().First())
+					},
+				},
 			},
 		},
 	}
@@ -1448,6 +1467,7 @@ func CreateDID(ctx context.Context, rpcURL, privateKey, id, registryAddress stri
 	if err != nil {
 		log.Fatalf("Cannot parse private key: %s", err)
 	}
+	publicKey := acc.Key().PublicKey
 
 	// Build DID identifier.
 	d := did.DID{Method: "gochain", ID: id}
@@ -1463,7 +1483,7 @@ func CreateDID(ctx context.Context, rpcURL, privateKey, id, registryAddress stri
 		ID:           publicKeyID,
 		Type:         "Secp256k1VerificationKey2018",
 		Controller:   d.String(),
-		PublicKeyHex: strings.TrimPrefix(acc.PublicKey(), "0x"),
+		PublicKeyHex: common.ToHex(crypto.FromECDSAPub(&publicKey)),
 	}}
 	doc.Authentications = []interface{}{publicKeyID}
 
@@ -1577,45 +1597,18 @@ func DIDHash(ctx context.Context, rpcURL, privateKey, id, registryAddress string
 }
 
 func ShowDID(ctx context.Context, rpcURL, privateKey, id, registryAddress string) {
-	if registryAddress == "" {
-		log.Fatalf("Registry contract address required")
-	}
-
-	d, err := did.Parse(id)
+	// Read current DID document for ID from IPFS.
+	doc, err := readDIDDocument(ctx, rpcURL, registryAddress, id)
 	if err != nil {
-		log.Fatalf("Invalid DID: %s", id)
+		log.Fatal(err)
 	}
 
-	client, err := web3.Dial(rpcURL)
+	// Pretty print document.
+	data, err := json.MarshalIndent(doc, "", "\t")
 	if err != nil {
-		log.Fatalf("Failed to connect to %q: %v", rpcURL, err)
+		log.Fatal(err)
 	}
-	defer client.Close()
-
-	myabi, err := abi.JSON(strings.NewReader(assets.DIDRegistryABI))
-	if err != nil {
-		log.Fatalf("Cannot initialize DIDRegistry ABI: %v", err)
-	}
-
-	var idBytes32 [32]byte
-	copy(idBytes32[:], d.ID)
-
-	result, err := web3.CallConstantFunction(ctx, client, myabi, registryAddress, "hash", idBytes32)
-	if err != nil {
-		log.Fatalf("Cannot call the contract: %v", err)
-	}
-
-	ctx, _ = context.WithTimeout(ctx, 10*time.Second)
-
-	hash := result.(string)
-	resp, err := http.Get(fmt.Sprintf("https://ipfs.infura.io:5001/api/v0/get?arg=%s", hash))
-	if err != nil {
-		log.Fatalf("Unable to fetch DID document from IPFS: %s", err)
-	}
-	defer resp.Body.Close()
-
-	io.Copy(os.Stdout, resp.Body)
-	fmt.Println("")
+	fmt.Println(string(data))
 }
 
 func SignClaim(ctx context.Context, rpcURL, privateKey, id, typ, issuerID, subjectID, subjectJSON string) {
@@ -1675,6 +1668,9 @@ func SignClaim(ctx context.Context, rpcURL, privateKey, id, typ, issuerID, subje
 		log.Fatalf("Cannot sign credential: %s", err)
 	}
 
+	fmt.Printf("dbg/H   %x\n", h[:])
+	fmt.Printf("dbg/SIG %x\n", proofValue)
+
 	// Add proof to credential.
 	cred.Proof = &vc.Proof{
 		Type:       "Secp256k1VerificationKey2018",
@@ -1688,6 +1684,58 @@ func SignClaim(ctx context.Context, rpcURL, privateKey, id, typ, issuerID, subje
 		log.Fatal(err)
 	}
 	fmt.Println(string(output))
+}
+
+func VerifyClaim(ctx context.Context, rpcURL, privateKey, registryAddress, filename string) {
+	// Decode file into VerifiableCredential.
+	var cred vc.VerifiableCredential
+	if buf, err := ioutil.ReadFile(filename); err != nil {
+		log.Fatalf("Cannot read file: %s", err)
+	} else if err := json.Unmarshal(buf, &cred); err != nil {
+		log.Fatalf("Cannot decode credential: %s", err)
+	}
+
+	// Read issuer DID document.
+	doc, err := readDIDDocument(ctx, rpcURL, registryAddress, cred.Issuer)
+	if err != nil {
+		log.Fatalf("Cannot read issuer DID document: %s", err)
+	}
+
+	// Encode credential to JSON without proof to generate hash.
+	other := cred // shallow copy
+	other.Proof = nil
+	hw := sha3.NewLegacyKeccak256()
+	if err := json.NewEncoder(hw).Encode(other); err != nil {
+		log.Fatalf("Cannot hash claim: %s", err)
+	}
+	var h common.Hash
+	hw.Sum(h[:0])
+
+	// Attempt verification against each of issuer's public keys.
+	// Only Secp256k1 is currently supported.
+	var verified bool
+	for _, pub := range doc.PublicKeys {
+		if pub.Type != "Secp256k1VerificationKey2018" {
+			continue
+		}
+
+		pubkey := common.Hex2Bytes(strings.TrimPrefix(pub.PublicKeyHex, "0x"))
+		fmt.Printf("dbg/H   %x\n", h[:])
+		fmt.Printf("dbg/PUB %x\n", pubkey)
+		fmt.Printf("dbg/SIG %x\n", common.Hex2Bytes(cred.Proof.ProofValue))
+		if crypto.VerifySignature(pubkey, h[:], common.Hex2Bytes(cred.Proof.ProofValue)) {
+			verified = true
+			break
+		}
+	}
+
+	// Display error if no keys can verify the signature.
+	if !verified {
+		log.Fatalf("Credential cannot be verified by issuer: %s", cred.Issuer)
+	}
+
+	// Display credential info on success.
+	fmt.Println("Verified")
 }
 
 func marshalJSON(data interface{}) string {
@@ -1746,4 +1794,49 @@ func IPFSUpload(ctx context.Context, name string, data []byte) (string, error) {
 		return "", err
 	}
 	return jsonResp.Hash, nil
+}
+
+func readDIDDocument(ctx context.Context, rpcURL, registryAddress, id string) (*did.Document, error) {
+	if registryAddress == "" {
+		return nil, fmt.Errorf("Registry contract address required")
+	}
+
+	d, err := did.Parse(id)
+	if err != nil {
+		return nil, fmt.Errorf("Invalid DID: %s", id)
+	}
+
+	client, err := web3.Dial(rpcURL)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to connect to %q: %v", rpcURL, err)
+	}
+	defer client.Close()
+
+	myabi, err := abi.JSON(strings.NewReader(assets.DIDRegistryABI))
+	if err != nil {
+		return nil, fmt.Errorf("Cannot initialize DIDRegistry ABI: %v", err)
+	}
+
+	var idBytes32 [32]byte
+	copy(idBytes32[:], d.ID)
+
+	result, err := web3.CallConstantFunction(ctx, client, myabi, registryAddress, "hash", idBytes32)
+	if err != nil {
+		return nil, fmt.Errorf("Cannot call the contract: %v", err)
+	}
+
+	ctx, _ = context.WithTimeout(ctx, 10*time.Second)
+
+	hash := result.(string)
+	resp, err := http.Get(fmt.Sprintf("https://ipfs.infura.io:5001/api/v0/cat?arg=%s", hash))
+	if err != nil {
+		return nil, fmt.Errorf("Unable to fetch DID document from IPFS: %s", err)
+	}
+	defer resp.Body.Close()
+
+	var doc did.Document
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
+		return nil, fmt.Errorf("Unable to decode DID document: %s", err)
+	}
+	return &doc, nil
 }
