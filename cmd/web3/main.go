@@ -43,10 +43,11 @@ const (
 ( (_-. )(_)(( (__  ) _ (  /(__)\  _)(_  )  ( 
  \___/(_____)\___)(_) (_)(__)(__)(____)(_)\_)`
 
-	pkVarName      = "WEB3_PRIVATE_KEY"
-	addrVarName    = "WEB3_ADDRESS"
-	networkVarName = "WEB3_NETWORK"
-	rpcURLVarName  = "WEB3_RPC_URL"
+	pkVarName          = "WEB3_PRIVATE_KEY"
+	addrVarName        = "WEB3_ADDRESS"
+	networkVarName     = "WEB3_NETWORK"
+	rpcURLVarName      = "WEB3_RPC_URL"
+	didRegistryVarName = "WEB3_DID_REGISTRY"
 )
 
 func main() {
@@ -625,8 +626,9 @@ func main() {
 							Destination: &privateKey,
 						},
 						cli.StringFlag{
-							Name:  "registry",
-							Usage: "Registry contract address",
+							Name:   "registry",
+							Usage:  "Registry contract address",
+							EnvVar: didRegistryVarName,
 						},
 					},
 					Action: func(c *cli.Context) {
@@ -644,8 +646,9 @@ func main() {
 							Destination: &privateKey,
 						},
 						cli.StringFlag{
-							Name:  "registry",
-							Usage: "Registry contract address",
+							Name:   "registry",
+							Usage:  "Registry contract address",
+							EnvVar: didRegistryVarName,
 						},
 					},
 					Action: func(c *cli.Context) {
@@ -663,8 +666,9 @@ func main() {
 							Destination: &privateKey,
 						},
 						cli.StringFlag{
-							Name:  "registry",
-							Usage: "Registry contract address",
+							Name:   "registry",
+							Usage:  "Registry contract address",
+							EnvVar: didRegistryVarName,
 						},
 					},
 					Action: func(c *cli.Context) {
@@ -682,8 +686,9 @@ func main() {
 							Destination: &privateKey,
 						},
 						cli.StringFlag{
-							Name:  "registry",
-							Usage: "Registry contract address",
+							Name:   "registry",
+							Usage:  "Registry contract address",
+							EnvVar: didRegistryVarName,
 						},
 					},
 					Action: func(c *cli.Context) {
@@ -744,8 +749,9 @@ func main() {
 							Destination: &privateKey,
 						},
 						cli.StringFlag{
-							Name:  "registry",
-							Usage: "Registry contract address",
+							Name:   "registry",
+							Usage:  "Registry contract address",
+							EnvVar: didRegistryVarName,
 						},
 					},
 					Action: func(c *cli.Context) {
@@ -1452,12 +1458,15 @@ const MaxDIDLength = 32
 func CreateDID(ctx context.Context, rpcURL, privateKey, id, registryAddress string) {
 	if registryAddress == "" {
 		log.Fatalf("Registry contract address required")
+	} else if id == "" {
+		log.Fatalf("DID required")
 	}
 
-	if id == "" {
-		log.Fatalf("ID required")
-	} else if !did.IsValidIDString(id) {
-		log.Fatalf("ID contains invalid characters")
+	d, err := did.Parse(id)
+	if err != nil {
+		log.Fatalf("Invalid DID: %s", err)
+	} else if d.Method != "go" {
+		log.Fatalf("Only 'go' DID methods can be registered.")
 	} else if len(id) > MaxDIDLength {
 		log.Fatalf("ID must be less than 32 characters")
 	}
@@ -1470,8 +1479,8 @@ func CreateDID(ctx context.Context, rpcURL, privateKey, id, registryAddress stri
 	publicKey := acc.Key().PublicKey
 
 	// Build DID identifier.
-	d := did.DID{Method: "gochain", ID: id}
-	publicKeyID := (&did.DID{Method: "gochain", ID: id, Fragment: "owner"}).String()
+	publicKeyID := *d
+	publicKeyID.Fragment = "owner"
 
 	// Build DID document.
 	now := time.Now()
@@ -1480,12 +1489,12 @@ func CreateDID(ctx context.Context, rpcURL, privateKey, id, registryAddress stri
 	doc.Created = &now
 	doc.Updated = &now
 	doc.PublicKeys = []did.PublicKey{{
-		ID:           publicKeyID,
+		ID:           publicKeyID.String(),
 		Type:         "Secp256k1VerificationKey2018",
 		Controller:   d.String(),
 		PublicKeyHex: common.ToHex(crypto.FromECDSAPub(&publicKey)),
 	}}
-	doc.Authentications = []interface{}{publicKeyID}
+	doc.Authentications = []interface{}{publicKeyID.String()}
 
 	// Pretty print document.
 	data, err := json.MarshalIndent(doc, "", "\t")
@@ -1511,7 +1520,7 @@ func CreateDID(ctx context.Context, rpcURL, privateKey, id, registryAddress stri
 	}
 
 	var idBytes32 [32]byte
-	copy(idBytes32[:], id)
+	copy(idBytes32[:], d.ID)
 
 	tx, err := web3.CallTransactFunction(ctx, client, myabi, registryAddress, privateKey, "register", 0, idBytes32, hash)
 	if err != nil {
@@ -1569,7 +1578,7 @@ func DIDHash(ctx context.Context, rpcURL, privateKey, id, registryAddress string
 
 	d, err := did.Parse(id)
 	if err != nil {
-		log.Fatalf("Invalid DID: %s", id)
+		log.Fatalf("Invalid DID: %s", err)
 	}
 
 	client, err := web3.Dial(rpcURL)
@@ -1668,8 +1677,8 @@ func SignClaim(ctx context.Context, rpcURL, privateKey, id, typ, issuerID, subje
 		log.Fatalf("Cannot sign credential: %s", err)
 	}
 
-	fmt.Printf("dbg/H   %x\n", h[:])
-	fmt.Printf("dbg/SIG %x\n", proofValue)
+	// Trim "V" off end of proof value.
+	proofValue = proofValue[:len(proofValue)-1]
 
 	// Add proof to credential.
 	cred.Proof = &vc.Proof{
@@ -1720,9 +1729,6 @@ func VerifyClaim(ctx context.Context, rpcURL, privateKey, registryAddress, filen
 		}
 
 		pubkey := common.Hex2Bytes(strings.TrimPrefix(pub.PublicKeyHex, "0x"))
-		fmt.Printf("dbg/H   %x\n", h[:])
-		fmt.Printf("dbg/PUB %x\n", pubkey)
-		fmt.Printf("dbg/SIG %x\n", common.Hex2Bytes(cred.Proof.ProofValue))
 		if crypto.VerifySignature(pubkey, h[:], common.Hex2Bytes(cred.Proof.ProofValue)) {
 			verified = true
 			break
@@ -1731,11 +1737,44 @@ func VerifyClaim(ctx context.Context, rpcURL, privateKey, registryAddress, filen
 
 	// Display error if no keys can verify the signature.
 	if !verified {
-		log.Fatalf("Credential cannot be verified by issuer: %s", cred.Issuer)
+		fmt.Println("Status: NOT VERIFIED")
+		os.Exit(1)
 	}
 
+	// Extract subject & extract ID.
+	subject := cred.CredentialSubject
+	if subject == nil {
+		subject = make(map[string]interface{})
+	}
+	subjectID := subject["id"]
+	delete(subject, "id")
+
+	// Sort subject keys.
+	keys := make([]string, 0, len(subject))
+	for k := range subject {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	// Display credential info on success.
-	fmt.Println("Verified")
+
+	fmt.Printf("ID:      %s\n", cred.ID)
+	fmt.Printf("Type:    %s\n", strings.Join(cred.Type, ", "))
+	fmt.Println("Status:  VERIFIED")
+	fmt.Println("")
+
+	fmt.Printf("Subject:   %s\n", subjectID)
+	fmt.Printf("Issuer:    %s\n", cred.Issuer)
+	fmt.Printf("Issued On: %s\n", cred.IssuanceDate)
+	fmt.Println("")
+
+	if len(keys) != 0 {
+		fmt.Println("CLAIMS:")
+		for _, k := range keys {
+			fmt.Printf("%s: %v\n", k, subject[k])
+		}
+		fmt.Println("")
+	}
 }
 
 func marshalJSON(data interface{}) string {
